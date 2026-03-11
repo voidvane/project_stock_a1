@@ -3,23 +3,38 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 import shutil
 import os
+import time
+import urllib.parse
+import re
+import html
+import xml.etree.ElementTree as ET
+import requests  # [버그수정 #1] requests 임포트 추가 (fetch_news_for_domestic에서 사용)
 
-# Try to clear yfinance cache if it's causing issues
-try:
+def clear_yfinance_cache():
     cache_dirs = [
         os.path.join(os.path.expanduser("~"), ".cache", "py-yfinance"),
         os.path.join(os.path.expanduser("~"), ".cache", "yfinance"),
-        os.path.join(os.path.expanduser("~"), "AppData", "Local", "py-yfinance"), # Windows
-        os.path.join(os.path.expanduser("~"), "AppData", "Local", "yfinance"),    # Windows
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "py-yfinance"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "yfinance"),
     ]
     for d in cache_dirs:
         if os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
-except Exception:
-    pass
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+# [버그수정] 매 실행마다 캐시를 삭제하면 멀티스레드 환경(Streamlit)에서 
+# "unable to open database file" 오류(SQLite Lock)가 발생할 수 있음.
+# 필요한 경우에만 수동으로 호출하거나, 자동 삭제 로직을 제거함.
+# try:
+#     clear_yfinance_cache()
+# except Exception:
+#     pass
 
 # ══════════════════════════════════════════════════════════════════════
 # KOREAN STOCK NAME → TICKER DICTIONARY  (popular ~80 stocks)
@@ -122,12 +137,9 @@ def search_stock_suggestions(query, max_results=8):
 
     # 2) yfinance Search fallback/complement
     try:
-        # Note: 'max_results' is not supported in recent yfinance Search()
-        # It returns a fixed number (usually 6-10)
         search_results = yf.Search(query)
         for item in getattr(search_results, 'quotes', []):
             symbol = item.get('symbol', '')
-            # Yahoo search sometimes hits non-equity indices or OTC, but for KR it's usually good
             name = item.get('shortname', item.get('longname', symbol))
             if symbol and symbol not in seen_tickers:
                 results.append((name, symbol))
@@ -136,6 +148,75 @@ def search_stock_suggestions(query, max_results=8):
         pass
 
     return results[:max_results]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# [신규 기능] 기술적 지표 계산 함수
+# ══════════════════════════════════════════════════════════════════════
+def compute_rsi(series, period=14):
+    """RSI 계산 (Relative Strength Index)"""
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, float('nan'))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def compute_macd(series, fast=12, slow=26, signal=9):
+    """MACD 계산 (Moving Average Convergence Divergence)"""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_bollinger_bands(series, period=20, std_dev=2):
+    """볼린저 밴드 계산"""
+    sma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    return upper, sma, lower
+
+
+# ══════════════════════════════════════════════════════════════════════
+# [신규 기능] 가격 포맷 함수 (통화별 구분)
+# ══════════════════════════════════════════════════════════════════════
+def format_price(price, currency="USD"):
+    """통화에 따라 가격 형식 지정"""
+    if not isinstance(price, (int, float)):
+        return str(price)
+    if currency in ("KRW", "KRW"):
+        return f"{int(price):,}"
+    return f"{price:,.2f}"
+
+
+def format_market_cap(market_cap, currency="USD"):
+    """[개선] 통화에 따른 시가총액 단위 표시 (한국: 조/억, 해외: T/B/M)"""
+    if not isinstance(market_cap, (int, float)) or market_cap == 0:
+        return "N/A"
+    if currency == "KRW":
+        if market_cap >= 1e12:
+            return f"{market_cap/1e12:.1f}조"
+        elif market_cap >= 1e8:
+            return f"{market_cap/1e8:.0f}억"
+        else:
+            return f"{market_cap:,.0f}원"
+    else:
+        if market_cap >= 1e12:
+            return f"{market_cap/1e12:.2f}T"
+        elif market_cap >= 1e9:
+            return f"{market_cap/1e9:.2f}B"
+        elif market_cap >= 1e6:
+            return f"{market_cap/1e6:.2f}M"
+        else:
+            return f"{market_cap:,}"
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 1. PAGE CONFIG (must be first Streamlit call)
@@ -185,7 +266,18 @@ TRANSLATIONS = {
         "analysis_signals": "Analysis & Signals",
         "sma20": "SMA 20",
         "sma50": "SMA 50",
+        "sma120": "SMA 120",
+        "bb_upper": "BB Upper",
+        "bb_lower": "BB Lower",
         "volume": "Volume",
+        "rsi": "RSI (14)",
+        "macd": "MACD",
+        "macd_signal": "Signal",
+        "macd_hist": "Histogram",
+        "indicator_options": "Indicator Options",
+        "show_bb": "Bollinger Bands",
+        "show_rsi": "RSI",
+        "show_macd": "MACD",
         "no_chart": "No chart data available.",
         "no_financials": "No financial data available.",
         "market_consensus": "MARKET CONSENSUS",
@@ -241,6 +333,13 @@ TRANSLATIONS = {
         "news_highlights": "News Highlights",
         "domestic": "Domestic",
         "overseas": "Overseas",
+        "back_to_home": "Back to Dashboard",
+        "rsi_overbought": "RSI Overbought (>70): Potential reversal risk.",
+        "rsi_oversold": "RSI Oversold (<30): Potential rebound opportunity.",
+        "rsi_neutral": "RSI Neutral (30–70): No extreme signal.",
+        "macd_bullish": "MACD above signal line: Bullish momentum.",
+        "macd_bearish": "MACD below signal line: Bearish momentum.",
+        "tech_signals": "Technical Signals",
     },
     "ko": {
         "app_title": "PRO 주식 분석기",
@@ -276,7 +375,18 @@ TRANSLATIONS = {
         "analysis_signals": "분석 & 시그널",
         "sma20": "20일선",
         "sma50": "50일선",
+        "sma120": "120일선",
+        "bb_upper": "볼린저 상단",
+        "bb_lower": "볼린저 하단",
         "volume": "거래량",
+        "rsi": "RSI (14)",
+        "macd": "MACD",
+        "macd_signal": "시그널",
+        "macd_hist": "히스토그램",
+        "indicator_options": "보조지표 설정",
+        "show_bb": "볼린저 밴드",
+        "show_rsi": "RSI",
+        "show_macd": "MACD",
         "no_chart": "차트 데이터가 없습니다.",
         "no_financials": "재무 데이터가 없습니다.",
         "market_consensus": "시장 컨센서스",
@@ -332,13 +442,20 @@ TRANSLATIONS = {
         "news_highlights": "이 시각 뉴스",
         "domestic": "국내",
         "overseas": "해외",
+        "back_to_home": "메인으로 돌아가기",
+        "rsi_overbought": "RSI 과매수 (>70): 조정 가능성 주의.",
+        "rsi_oversold": "RSI 과매도 (<30): 반등 기회 가능성.",
+        "rsi_neutral": "RSI 중립 (30–70): 극단적 신호 없음.",
+        "macd_bullish": "MACD 시그널 상향 돌파: 상승 모멘텀.",
+        "macd_bearish": "MACD 시그널 하향 돌파: 하락 모멘텀.",
+        "tech_signals": "기술적 시그널",
     },
 }
 
 
 def t(key):
     """Return translated string for the current language."""
-    lang = st.session_state.get("lang", "en")
+    lang = st.session_state.get("lang", "ko")
     return TRANSLATIONS[lang].get(key, key)
 
 
@@ -355,6 +472,10 @@ st.markdown("""
     .stApp {
         background-color: #0d1117;
         color: #c9d1d9;
+    }
+
+    header[data-testid="stHeader"] {
+        background-color: #0d1117;
     }
 
     /* ── Sidebar ──────────────────────────────────── */
@@ -585,6 +706,19 @@ st.markdown("""
         display: flex; align-items: center;
     }
     .dash-section-title::after { content: ' >'; color: #8b949e; margin-left: 5px; font-size: 14px; }
+
+    /* [신규] 기술적 신호 배지 */
+    .signal-badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 700;
+        margin: 3px 2px;
+    }
+    .signal-bull { background: rgba(63,185,80,0.15); color: #3fb950; border: 1px solid #3fb950; }
+    .signal-bear { background: rgba(248,81,73,0.15); color: #f85149; border: 1px solid #f85149; }
+    .signal-neutral { background: rgba(210,168,255,0.15); color: #d2a8ff; border: 1px solid #d2a8ff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -594,51 +728,92 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=600)
 def fetch_stock_data(ticker_symbol, period):
-    try:
-        stock = yf.Ticker(ticker_symbol)
-        info = stock.info
-
-        if "shortName" not in info and "longName" not in info:
-            return None, "NOT_FOUND"
-
-        hist = stock.history(period=period)
-        financials = stock.financials
-
-        # News — safe extraction
+    for attempt in range(3):
         try:
-            news_raw = stock.news or []
-        except Exception:
-            news_raw = []
+            stock = yf.Ticker(ticker_symbol)
+            info = stock.info
 
-        news_items = []
-        for item in news_raw[:8]:
-            title = item.get("title", "")
-            link = item.get("link", "")
-            publisher = item.get("publisher", "")
-            pub_date = ""
-            ts = item.get("providerPublishTime")
-            if ts:
+            if "shortName" not in info and "longName" not in info:
+                return None, "NOT_FOUND"
+
+            hist = stock.history(period=period)
+            financials = stock.financials
+            try:
+                news_raw = stock.news or []
+            except Exception:
+                news_raw = []
+
+            # [버그수정 #2] yfinance 최신 버전 뉴스 형식 대응
+            # 구버전: {"title": ..., "link": ..., "publisher": ...}
+            # 신버전: {"content": {"title": ..., "clickThroughUrl": {"url": ...}, "provider": {"displayName": ...}}}
+            news_items = []
+            for item in news_raw[:8]:
+                title = ""
+                link = ""
+                publisher = ""
+                pub_date = ""
+
+                # 신버전 형식 시도
+                content = item.get("content", {})
+                if content and isinstance(content, dict):
+                    title = content.get("title", "")
+                    click_url = content.get("clickThroughUrl", {})
+                    link = click_url.get("url", "") if isinstance(click_url, dict) else ""
+                    provider = content.get("provider", {})
+                    publisher = provider.get("displayName", "") if isinstance(provider, dict) else ""
+                    pub_date_raw = content.get("pubDate", "")
+                    if pub_date_raw:
+                        try:
+                            dt = datetime.fromisoformat(pub_date_raw.replace("Z", "+00:00"))
+                            pub_date = dt.strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            pub_date = pub_date_raw[:16]
+
+                # 구버전 형식 폴백
+                if not title:
+                    title = item.get("title", "")
+                    link = item.get("link", item.get("url", ""))
+                    publisher = item.get("publisher", item.get("source", ""))
+                    ts = item.get("providerPublishTime")
+                    if ts:
+                        try:
+                            pub_date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            pass
+
+                if title:
+                    news_items.append({
+                        "title": title,
+                        "link": link,
+                        "publisher": publisher,
+                        "date": pub_date
+                    })
+
+            return {
+                "info": info,
+                "hist": hist,
+                "financials": financials,
+                "news": news_items,
+            }, None
+
+        except Exception as e:
+            if attempt == 2:
+                return None, str(e)
+            if "database" in str(e).lower() or "lock" in str(e).lower():
                 try:
-                    pub_date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+                    clear_yfinance_cache()
                 except Exception:
                     pass
-            if title:
-                news_items.append({"title": title, "link": link, "publisher": publisher, "date": pub_date})
-
-        return {
-            "info": info,
-            "hist": hist,
-            "financials": financials,
-            "news": news_items,
-        }, None
-    except Exception as e:
-        return None, str(e)
+                time.sleep(0.5)
+            else:
+                time.sleep(0.2)
+    
+    return None, "Unknown error after retries"
 
 
 @st.cache_data(ttl=300)
 def fetch_dashboard_data():
     """Fetch indices and ranking data for the dashboard (Domestic & Overseas)."""
-    # 1. Define Domestic (KR) Assets
     indices_kr = {
         "^KS11": "KOSPI", 
         "^KQ11": "KOSDAQ", 
@@ -649,7 +824,6 @@ def fetch_dashboard_data():
         "000270.KS", "068270.KS", "105560.KS", "005490.KS", "032830.KS"
     ]
 
-    # 2. Define Overseas (US) Assets
     indices_us = {
         "^DJI": "Dow Jones", 
         "^IXIC": "NASDAQ", 
@@ -664,18 +838,15 @@ def fetch_dashboard_data():
     ]
 
     def process_tickers(ticker_dict, period="2d"):
-        """Helper to fetch and process index/ticker data."""
         results = []
         tickers = list(ticker_dict.keys())
-        
-        # Try bulk download
         data = pd.DataFrame()
         try:
-            data = yf.download(tickers, period=period, interval="1d", progress=False, threads=False)
+            # [버그수정 #3] threads 파라미터 제거 (최신 yfinance 미지원)
+            data = yf.download(tickers, period=period, interval="1d", progress=False)
         except Exception:
             pass
             
-        # If bulk failed or empty, fallback to individual
         if data.empty:
             for sym, name in ticker_dict.items():
                 try:
@@ -686,10 +857,9 @@ def fetch_dashboard_data():
                         delta = close - prev
                         pct = (delta / prev * 100) if prev != 0 else 0
                         results.append({"ticker": sym, "name": name, "val": close, "delta": delta, "pct": pct})
-                except:
+                except Exception:
                     continue
         else:
-            # Process bulk
             for sym, name in ticker_dict.items():
                 try:
                     close_series = None
@@ -708,16 +878,15 @@ def fetch_dashboard_data():
                         delta = close - prev
                         pct = (delta / prev * 100) if prev != 0 else 0
                         results.append({"ticker": sym, "name": name, "val": close, "delta": delta, "pct": pct})
-                except:
+                except Exception:
                     continue
         return results
 
     def process_rankings(ticker_list, period="5d"):
-        """Helper to fetch and process ranking data."""
         results = []
         data = pd.DataFrame()
         try:
-            data = yf.download(ticker_list, period=period, interval="1d", progress=False, threads=False)
+            data = yf.download(ticker_list, period=period, interval="1d", progress=False)
         except Exception:
             pass
 
@@ -730,18 +899,11 @@ def fetch_dashboard_data():
                         prev = float(t_hist['Close'].iloc[-2])
                         delta = close - prev
                         pct = (delta / prev * 100) if prev != 0 else 0
-                        
-                        # Name resolution
                         name = sym
                         if sym in KR_STOCK_MAP.values():
-                             name = next((k for k, v in KR_STOCK_MAP.items() if v == sym), sym)
-                        
-                        results.append({
-                            "ticker": sym, 
-                            "name": name,
-                            "price": close, "pct": pct
-                        })
-                except:
+                            name = next((k for k, v in KR_STOCK_MAP.items() if v == sym), sym)
+                        results.append({"ticker": sym, "name": name, "price": close, "pct": pct})
+                except Exception:
                     continue
         else:
             for sym in ticker_list:
@@ -752,46 +914,308 @@ def fetch_dashboard_data():
                             s_data = data['Close'][sym].dropna()
                     else:
                         if 'Close' in data.columns:
-                             s_data = data['Close'].dropna()
+                            s_data = data['Close'].dropna()
                     
                     if s_data is not None and len(s_data) >= 2:
                         close = float(s_data.iloc[-1])
                         prev = float(s_data.iloc[-2])
                         delta = close - prev
                         pct = (delta / prev * 100) if prev != 0 else 0
-                        
-                        # Name resolution
                         name = sym
                         if sym in KR_STOCK_MAP.values():
-                             name = next((k for k, v in KR_STOCK_MAP.items() if v == sym), sym)
-
-                        results.append({
-                            "ticker": sym, 
-                            "name": name,
-                            "price": close, "pct": pct
-                        })
-                except:
+                            name = next((k for k, v in KR_STOCK_MAP.items() if v == sym), sym)
+                        results.append({"ticker": sym, "name": name, "price": close, "pct": pct})
+                except Exception:
                     continue
         return results
 
     try:
-        # Fetch Data
         idx_kr_results = process_tickers(indices_kr)
         idx_us_results = process_tickers(indices_us)
-        
         rank_kr_results = process_rankings(popular_kr)
         rank_us_results = process_rankings(popular_us)
-        
-        # News
-        news_data = getattr(yf.Search("Stock Market"), 'quotes', [])
-        
+
+        # [버그수정 #4] 해외 뉴스: yf.Search quotes는 뉴스가 아닌 종목 검색 결과
+        # → 실제 야후 파이낸스 뉴스를 Google RSS로 대체
+        us_news = fetch_us_market_news()
+
         return {
             "kr": {"indices": idx_kr_results, "rankings": rank_kr_results},
             "us": {"indices": idx_us_results, "rankings": rank_us_results},
-            "news": news_data
+            "news": us_news
         }, None
     except Exception as e:
         return None, str(e)
+
+
+@st.cache_data(ttl=300)
+def fetch_us_market_news(max_items=6):
+    """[신규] 미국 주식 시장 뉴스를 Google News RSS에서 가져오기"""
+    results = []
+    queries = ["US stock market", "Wall Street"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    for query in queries:
+        try:
+            encoded_query = urllib.parse.quote(query)
+            rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en&gl=US&ceid=US:en"
+            resp = requests.get(rss_url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                root = ET.fromstring(resp.content)
+                for item in root.findall(".//item")[:3]:
+                    title_elem = item.find("title")
+                    link_elem = item.find("link")
+                    pub_elem = item.find("pubDate")
+                    source_elem = item.find("source")
+                    title = title_elem.text if title_elem is not None else ""
+                    link = link_elem.text if link_elem is not None else "#"
+                    pub = pub_elem.text if pub_elem is not None else ""
+                    source = source_elem.text if source_elem is not None else "Google News"
+                    if title:
+                        # 제목에서 출처 제거
+                        if " - " in title:
+                            parts = title.rsplit(" - ", 1)
+                            if len(parts[1]) < 30:
+                                title = parts[0].strip()
+                        results.append({
+                            "title": title,
+                            "link": link,
+                            "publisher": source,
+                            "date": pub[:16] if pub else ""
+                        })
+        except Exception:
+            pass
+    return results[:max_items]
+
+
+@st.cache_data(ttl=300)
+def fetch_news_for_domestic(ticker_name, code):
+    """
+    국내 종목 최신 뉴스 제목을 Google News RSS에서 가져오고
+    실제 기사 링크를 반환합니다. (실패 시 Toss Invest 링크)
+    """
+    toss_url = f"https://www.tossinvest.com/stocks/A{code}/news"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    try:
+        encoded_query = urllib.parse.quote(ticker_name)
+        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
+        resp = requests.get(rss_url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            for item in items[:3]:
+                title = item.find("title").text if item.find("title") is not None else ""
+                pubDate = item.find("pubDate").text if item.find("pubDate") is not None else ""
+                link_elem = item.find("link")
+                link = link_elem.text if link_elem is not None else ""
+                
+                source_elem = item.find("source")
+                source = source_elem.text if source_elem is not None else ""
+                
+                if not title:
+                    continue
+
+                # 제목에서 출처 정리
+                if source and f" - {source}" in title:
+                    title = title.replace(f" - {source}", "")
+                elif " - " in title:
+                    parts = title.rsplit(" - ", 1)
+                    if len(parts) == 2:
+                        possible_source = parts[1].strip()
+                        if len(possible_source) < 20:
+                            if not source:
+                                source = possible_source
+                            title = parts[0].strip()
+
+                if not source:
+                    source = "뉴스"
+
+                pub_time = ""
+                if pubDate:
+                    try:
+                        # [버그수정 #5] 내부 import → 상단으로 이동 완료
+                        dt = parsedate_to_datetime(pubDate)
+                        now = datetime.now(dt.tzinfo)
+                        diff = now - dt
+                        if diff.days == 0:
+                            total_seconds = int(diff.total_seconds())
+                            hours = total_seconds // 3600
+                            mins = (total_seconds % 3600) // 60
+                            if hours > 0:
+                                pub_time = f"{hours}시간 전"
+                            elif mins > 0:
+                                pub_time = f"{mins}분 전"
+                            else:
+                                pub_time = "방금 전"
+                        elif diff.days < 7:
+                            pub_time = f"{diff.days}일 전"
+                        else:
+                            pub_time = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pub_time = pubDate[:16]
+
+                return {
+                    "title": title,
+                    "publisher": source,
+                    "time": pub_time,
+                    "link": link if link else toss_url
+                }
+    except Exception:
+        pass
+
+    return {
+        "title": f"{ticker_name} 관련 최신 뉴스 보기",
+        "publisher": "Toss Invest",
+        "time": "실시간",
+        "link": toss_url
+    }
+
+
+def kr_code_from_ticker(ticker):
+    if ticker in KR_STOCK_MAP:
+        ticker = KR_STOCK_MAP[ticker]
+    if ticker.endswith(".KS") or ticker.endswith(".KQ"):
+        ticker = ticker.split(".")[0]
+    if ticker.isdigit():
+        return ticker.zfill(6)
+    return None
+
+
+def render_domestic_news(rankings):
+    st.markdown(f"<div class='dash-section-title' style='margin-top:30px'>{t('news_highlights')}</div>", unsafe_allow_html=True)
+    
+    st.markdown("""
+    <style>
+    .news-list-item {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 10px;
+        transition: all 0.2s ease;
+        display: flex;
+        flex-direction: column;
+        text-decoration: none !important;
+    }
+    .news-list-item:hover {
+        border-color: #58a6ff;
+        background-color: #1f2428;
+    }
+    .news-header-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+    }
+    .news-stock-tag {
+        font-size: 12px;
+        font-weight: 600;
+        color: #58a6ff;
+        background: rgba(88, 166, 255, 0.1);
+        padding: 2px 6px;
+        border-radius: 4px;
+    }
+    .news-item-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #e6edf3;
+        margin-bottom: 6px;
+        line-height: 1.5;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+    }
+    .news-meta-row {
+        display: flex;
+        align-items: center;
+        font-size: 12px;
+        color: #8b949e;
+    }
+    .news-meta-divider {
+        margin: 0 6px;
+        color: #8b949e;
+    }
+    a.news-link {
+        text-decoration: none;
+        color: inherit;
+        display: block;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    items = []
+    for r in rankings[:5]:
+        ticker = r.get("ticker", "")
+        name = r.get("name", "")
+        code = kr_code_from_ticker(ticker)
+        if not code:
+            continue
+        if name == ticker or name.endswith(".KS") or name.endswith(".KQ"):
+            for k, v in KR_STOCK_MAP.items():
+                if v == ticker:
+                    name = k
+                    break
+        news_info = fetch_news_for_domestic(name, code)
+        items.append({"name": name, "code": code, **news_info})
+
+    if items:
+        for item in items:
+            # [버그수정 #6] html.escape()로 XSS 방지
+            safe_title = html.escape(item['title'])
+            safe_name = html.escape(item['name'])
+            safe_time = html.escape(item['time'])
+            safe_publisher = html.escape(item['publisher'])
+            safe_link = html.escape(item['link'])
+            st.markdown(f"""
+            <a href="{safe_link}" target="_blank" class="news-link">
+                <div class="news-list-item">
+                    <div class="news-header-row">
+                        <span class="news-stock-tag">{safe_name}</span>
+                    </div>
+                    <div class="news-item-title">{safe_title}</div>
+                    <div class="news-meta-row">
+                        <span>{safe_time}</span>
+                        <span class="news-meta-divider">·</span>
+                        <span>{safe_publisher}</span>
+                    </div>
+                </div>
+            </a>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("뉴스 데이터를 불러올 수 없습니다.")
+
+
+def render_news_highlights(news_items):
+    """[버그수정 #7] 해외 뉴스 렌더링 - 실제 뉴스 데이터 사용"""
+    st.markdown(f"<div class='dash-section-title' style='margin-top:30px'>{t('news_highlights')}</div>", unsafe_allow_html=True)
+    if news_items:
+        for item in news_items:
+            # [버그수정 #6] html.escape()로 XSS 방지
+            safe_title = html.escape(item.get("title", ""))
+            safe_pub = html.escape(item.get("publisher", "Google News"))
+            safe_date = html.escape(item.get("date", ""))
+            safe_link = html.escape(item.get("link", "#"))
+            st.markdown(f"""
+            <div class='news-grid-item'>
+                <div class='news-grid-content'>
+                    <div class='news-grid-title'>
+                        <a href="{safe_link}" target="_blank" style="color:#c9d1d9;text-decoration:none;">
+                            {safe_title}
+                        </a>
+                    </div>
+                    <div class='news-grid-meta'>{safe_pub} · {safe_date}</div>
+                </div>
+                <div class='news-grid-logo'>📰</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("No news highlights available.")
 
 
 def render_dashboard_section(data, key_prefix="kr"):
@@ -800,7 +1224,6 @@ def render_dashboard_section(data, key_prefix="kr"):
         st.info("No data available.")
         return
 
-    # 1. Index Cards
     indices = data.get("indices", [])
     if indices:
         cols = st.columns(len(indices)) if len(indices) > 0 else [st.container()]
@@ -809,7 +1232,7 @@ def render_dashboard_section(data, key_prefix="kr"):
             with cols[i]:
                 st.markdown(f"""
                 <div class='dash-card'>
-                    <div class='dash-index-title'>{item['name']}</div>
+                    <div class='dash-index-title'>{html.escape(item['name'])}</div>
                     <div class='dash-index-val'>{item['val']:,.2f}</div>
                     <div class='dash-index-delta' style='color:{color}'>
                         {'▼' if item['delta'] < 0 else '▲'} {abs(item['delta']):,.2f} ({item['pct']:.2f}%)
@@ -817,19 +1240,15 @@ def render_dashboard_section(data, key_prefix="kr"):
                 </div>
                 """, unsafe_allow_html=True)
     
-    # 2. Stock Rankings
     st.markdown(f"<div class='dash-section-title'>{t('stock_rankings')}</div>", unsafe_allow_html=True)
     rankings = data.get("rankings", [])
     
     if rankings:
         r_cols = st.columns(3)
         rank_labels = [t('top_value'), t('top_gainers'), t('top_losers')]
-        
-        # Sort for Gainer/Loser columns
         gainers = sorted(rankings, key=lambda x: x['pct'], reverse=True)
         losers = sorted(rankings, key=lambda x: x['pct'])
-        value = rankings # Mixed for variety (or sorted by volume if we had it, but here just default list)
-        
+        value = rankings
         col_data = [value[:5], gainers[:5], losers[:5]]
         
         for i, data_list in enumerate(col_data):
@@ -837,51 +1256,29 @@ def render_dashboard_section(data, key_prefix="kr"):
                 st.markdown(f"<div style='color:#8b949e;font-size:13px;margin-bottom:12px;font-weight:600'>{rank_labels[i]}</div>", unsafe_allow_html=True)
                 for idx, r in enumerate(data_list):
                     color = "#f85149" if r["pct"] < 0 else "#3fb950"
-                    # Use st.button tailored to look like a list row
-                    btn_label = f"{idx+1} \u2000 {r['name']} \u2000 | \u2000 {r['price']:,.2f} \u2000 | \u2000 {'▼' if r['pct'] < 0 else '▲'} {abs(r['pct']):.2f}%"
-                    
-                    # FIX: Do not update 'ticker_input' in session_state here to avoid StreamlitAPIException
+                    arrow = "▼" if r["pct"] < 0 else "▲"
+                    btn_label = f"{idx+1}  {r['name']}  |  {r['price']:,.0f}  |  {arrow} {abs(r['pct']):.2f}%"
                     if st.button(btn_label, key=f"rank_btn_{key_prefix}_{i}_{idx}", use_container_width=True):
                         st.session_state["auto_ticker"] = r['ticker']
                         st.rerun()
 
+
 def render_home_dashboard():
     """Render the M-able Wide style home dashboard."""
-    
     db_data, error = fetch_dashboard_data()
     if error:
         st.error(f"Dashboard error: {error}")
         return
 
-    # ── Tabs for Domestic / Overseas ──
     tab_kr, tab_us = st.tabs([f"🇰🇷 {t('domestic')}", f"🇺🇸 {t('overseas')}"])
 
     with tab_kr:
         render_dashboard_section(db_data["kr"], key_prefix="kr")
+        render_domestic_news(db_data["kr"].get("rankings", []))
 
     with tab_us:
         render_dashboard_section(db_data["us"], key_prefix="us")
-
-    # ── News Highlights (Common) ──
-    st.markdown(f"<div class='dash-section-title' style='margin-top:30px'>{t('news_highlights')}</div>", unsafe_allow_html=True)
-    news_items = db_data.get("news", [])
-    if news_items:
-        n_cols = st.columns(3)
-        for i in range(min(6, len(news_items))):
-            item = news_items[i]
-            title = item.get("shortname", "Market update...")
-            with n_cols[i % 3]:
-                st.markdown(f"""
-                <div class='news-grid-item'>
-                    <div class='news-grid-content'>
-                        <div class='news-grid-title'>{title[:50]}...</div>
-                        <div class='news-grid-meta'>Yahoo Finance · Live</div>
-                    </div>
-                    <div class='news-grid-logo'></div>
-                </div>
-                """, unsafe_allow_html=True)
-    else:
-        st.info("No news highlights available.")
+        render_news_highlights(db_data.get("news", []))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -892,15 +1289,15 @@ if "auto_ticker" in st.session_state and st.session_state["auto_ticker"]:
     st.session_state["trigger_analysis"] = True
     del st.session_state["auto_ticker"]
 
+# ══════════════════════════════════════════════════════════════════════
 # 6. SIDEBAR  (search · timeframe · language · quick-order)
 # ══════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    # Language toggle at very top
     lang = st.selectbox(
         "🌐",
-        options=["en", "ko"],
-        format_func=lambda x: "English" if x == "en" else "한국어",
+        options=["ko", "en"],  # [개선] 한국어 우선 표시
+        format_func=lambda x: "한국어" if x == "ko" else "English",
         index=0,
         key="lang",
     )
@@ -917,11 +1314,15 @@ with st.sidebar:
     )
     st.markdown("<hr style='border-color:#30363d'>", unsafe_allow_html=True)
 
-    # ── Search form ──
     with st.form("search_form"):
         st.subheader(t("symbol_header"))
         st.caption(t("symbol_hint"))
-        ticker_symbol = st.text_input("Ticker", value="NVDA", label_visibility="collapsed", key="ticker_input").upper()
+        ticker_symbol = st.text_input(
+            "Ticker",
+            value=st.session_state.get("ticker_input", "NVDA"),
+            label_visibility="collapsed",
+            key="ticker_input"
+        ).upper().strip()
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader(t("timeframe"))
@@ -965,7 +1366,7 @@ with st.sidebar:
 
 
 # ── Auto-resolve Korean names to tickers ──
-raw_input = ticker_symbol  # preserve original for suggestions
+raw_input = ticker_symbol
 resolved_ticker = ticker_symbol
 force_trigger = st.session_state.get("trigger_analysis", False)
 
@@ -973,11 +1374,9 @@ if (fetch_button or force_trigger) and ticker_symbol:
     if force_trigger:
         st.session_state["trigger_analysis"] = False
     
-    # Direct dictionary lookup (exact match)
     if ticker_symbol in KR_STOCK_MAP:
         resolved_ticker = KR_STOCK_MAP[ticker_symbol]
     else:
-        # Case-insensitive match
         for name, code in KR_STOCK_MAP.items():
             if name.upper() == ticker_symbol.upper():
                 resolved_ticker = code
@@ -991,7 +1390,6 @@ if (fetch_button or force_trigger) and resolved_ticker:
             st.error(t("ticker_not_found"))
             st.info(t("search_tip"))
 
-            # Show suggestions
             suggestions = search_stock_suggestions(raw_input)
             if suggestions:
                 st.markdown(f"### {t('search_suggest_title')}")
@@ -1002,8 +1400,8 @@ if (fetch_button or force_trigger) and resolved_ticker:
                         st.markdown(f"""
                         <div style='background:#161b22;border:1px solid #30363d;border-radius:6px;
                                     padding:12px;text-align:center;margin-bottom:8px'>
-                            <div style='color:#ffffff;font-size:14px;font-weight:600'>{name}</div>
-                            <div style='color:#58a6ff;font-size:12px;margin-top:4px'>{code}</div>
+                            <div style='color:#ffffff;font-size:14px;font-weight:600'>{html.escape(name)}</div>
+                            <div style='color:#58a6ff;font-size:12px;margin-top:4px'>{html.escape(code)}</div>
                         </div>
                         """, unsafe_allow_html=True)
                         if st.button(f"▶ {code}", key=f"suggest_{idx}", use_container_width=True):
@@ -1029,38 +1427,36 @@ if (fetch_button or force_trigger) and resolved_ticker:
             price_change = current_price - previous_close
             price_change_pct = (price_change / previous_close) * 100 if previous_close else 0
 
+            # ── Back Button ──
+            if st.button(f"← {t('back_to_home')}", key="back_btn"):
+                st.session_state["ticker_input"] = "NVDA"
+                st.session_state.pop("auto_ticker", None)
+                st.session_state["trigger_analysis"] = False
+                st.rerun()
+
             # ── Company Header ──
             st.markdown(
-                f"<div class='company-header'>{company_name} "
+                f"<div class='company-header'>{html.escape(company_name)} "
                 f"<span style='color:#8b949e;font-size:20px;font-weight:500;margin-left:8px'>"
-                f"{ticker_symbol}</span></div>",
+                f"{html.escape(ticker_symbol)}</span></div>",
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<div class='company-sub'>[ {sector} ] &nbsp; {industry} "
-                f"&nbsp;|&nbsp; {currency}</div>",
+                f"<div class='company-sub'>[ {html.escape(sector)} ] &nbsp; {html.escape(industry)} "
+                f"&nbsp;|&nbsp; {html.escape(currency)}</div>",
                 unsafe_allow_html=True,
             )
 
             # ── Key Metrics Row ──
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             with mc1:
-                st.metric(
-                    label=t("current_price"),
-                    value=f"{current_price:,.2f}",
-                    delta=f"{price_change:,.2f} ({price_change_pct:,.2f}%)",
-                )
+                # [개선] 통화별 가격 포맷
+                price_str = format_price(current_price, currency)
+                delta_str = f"{format_price(price_change, currency)} ({price_change_pct:,.2f}%)"
+                st.metric(label=t("current_price"), value=price_str, delta=delta_str)
             with mc2:
                 market_cap = info.get("marketCap", 0)
-                if market_cap >= 1e12:
-                    cap_str = f"{market_cap/1e12:.2f}T"
-                elif market_cap >= 1e9:
-                    cap_str = f"{market_cap/1e9:.2f}B"
-                elif market_cap >= 1e6:
-                    cap_str = f"{market_cap/1e6:.2f}M"
-                else:
-                    cap_str = f"{market_cap:,}"
-                st.metric(label=t("market_cap"), value=cap_str)
+                st.metric(label=t("market_cap"), value=format_market_cap(market_cap, currency))
             with mc3:
                 pe_ratio = info.get("trailingPE", "N/A")
                 st.metric(
@@ -1078,6 +1474,8 @@ if (fetch_button or force_trigger) and resolved_ticker:
                 if isinstance(vol, (int, float)):
                     if vol >= 1e6:
                         vol_str = f"{vol/1e6:.1f}M"
+                    elif vol >= 1e3:
+                        vol_str = f"{vol/1e3:.0f}K"
                     else:
                         vol_str = f"{vol:,.0f}"
                 else:
@@ -1091,9 +1489,6 @@ if (fetch_button or force_trigger) and resolved_ticker:
             # ══════════════════════════════════════════════════════════
             main_col, info_col = st.columns([7, 3])
 
-            # ──────────────────────────────────────────────────────────
-            # LEFT:  TABS  (Chart · Financials · Analysis)
-            # ──────────────────────────────────────────────────────────
             with main_col:
                 tab1, tab2, tab3 = st.tabs([
                     f"📊 {t('technical_chart')}",
@@ -1104,18 +1499,48 @@ if (fetch_button or force_trigger) and resolved_ticker:
                 # ── TAB 1 : Technical Chart ──
                 with tab1:
                     if not hist.empty:
-                        # Compute SMAs
+                        # [신규 기능] 보조지표 옵션 선택
+                        with st.expander(f"⚙️ {t('indicator_options')}", expanded=False):
+                            ind_col1, ind_col2, ind_col3 = st.columns(3)
+                            with ind_col1:
+                                show_bb = st.checkbox(t("show_bb"), value=False, key="show_bb")
+                            with ind_col2:
+                                show_rsi = st.checkbox(t("show_rsi"), value=True, key="show_rsi")
+                            with ind_col3:
+                                show_macd = st.checkbox(t("show_macd"), value=False, key="show_macd")
+
+                        # 지표 계산
                         hist["SMA20"] = hist["Close"].rolling(window=20).mean()
                         hist["SMA50"] = hist["Close"].rolling(window=50).mean()
+                        hist["SMA120"] = hist["Close"].rolling(window=120).mean()
+
+                        if show_bb:
+                            hist["BB_Upper"], hist["BB_Mid"], hist["BB_Lower"] = compute_bollinger_bands(hist["Close"])
+
+                        # RSI 계산
+                        rsi_series = compute_rsi(hist["Close"])
+
+                        # MACD 계산
+                        macd_line, signal_line, macd_hist_vals = compute_macd(hist["Close"])
+
+                        # 행 수 동적 결정
+                        n_rows = 2
+                        row_heights = [0.65, 0.15]
+                        if show_rsi:
+                            n_rows += 1
+                            row_heights.append(0.10)
+                        if show_macd:
+                            n_rows += 1
+                            row_heights.append(0.10)
 
                         fig = make_subplots(
-                            rows=2, cols=1,
+                            rows=n_rows, cols=1,
                             shared_xaxes=True,
                             vertical_spacing=0.03,
-                            row_heights=[0.75, 0.25],
+                            row_heights=row_heights,
                         )
 
-                        # Candlestick
+                        # 캔들스틱
                         fig.add_trace(
                             go.Candlestick(
                                 x=hist.index,
@@ -1134,46 +1559,92 @@ if (fetch_button or force_trigger) and resolved_ticker:
 
                         # SMA 20
                         fig.add_trace(
-                            go.Scatter(
-                                x=hist.index,
-                                y=hist["SMA20"],
-                                mode="lines",
-                                line=dict(color="#58a6ff", width=1.2),
-                                name=t("sma20"),
-                            ),
+                            go.Scatter(x=hist.index, y=hist["SMA20"], mode="lines",
+                                       line=dict(color="#58a6ff", width=1.2), name=t("sma20")),
                             row=1, col=1,
                         )
 
                         # SMA 50
                         fig.add_trace(
-                            go.Scatter(
-                                x=hist.index,
-                                y=hist["SMA50"],
-                                mode="lines",
-                                line=dict(color="#d2a8ff", width=1.2),
-                                name=t("sma50"),
-                            ),
+                            go.Scatter(x=hist.index, y=hist["SMA50"], mode="lines",
+                                       line=dict(color="#d2a8ff", width=1.2), name=t("sma50")),
                             row=1, col=1,
                         )
 
-                        # Volume bars
+                        # [신규] SMA 120
+                        fig.add_trace(
+                            go.Scatter(x=hist.index, y=hist["SMA120"], mode="lines",
+                                       line=dict(color="#e3b341", width=1.2, dash="dot"), name=t("sma120")),
+                            row=1, col=1,
+                        )
+
+                        # [신규] 볼린저 밴드
+                        if show_bb and "BB_Upper" in hist.columns:
+                            fig.add_trace(
+                                go.Scatter(x=hist.index, y=hist["BB_Upper"], mode="lines",
+                                           line=dict(color="rgba(88,166,255,0.4)", width=1, dash="dash"),
+                                           name=t("bb_upper"), showlegend=True),
+                                row=1, col=1,
+                            )
+                            fig.add_trace(
+                                go.Scatter(x=hist.index, y=hist["BB_Lower"], mode="lines",
+                                           line=dict(color="rgba(88,166,255,0.4)", width=1, dash="dash"),
+                                           fill='tonexty',
+                                           fillcolor="rgba(88,166,255,0.05)",
+                                           name=t("bb_lower"), showlegend=True),
+                                row=1, col=1,
+                            )
+
+                        # 거래량
                         colors = [
                             "#3fb950" if c >= o else "#f85149"
                             for c, o in zip(hist["Close"], hist["Open"])
                         ]
                         fig.add_trace(
-                            go.Bar(
-                                x=hist.index,
-                                y=hist["Volume"],
-                                marker_color=colors,
-                                opacity=0.55,
-                                name=t("volume"),
-                            ),
+                            go.Bar(x=hist.index, y=hist["Volume"], marker_color=colors,
+                                   opacity=0.55, name=t("volume")),
                             row=2, col=1,
                         )
 
+                        current_row = 3
+
+                        # [신규] RSI
+                        if show_rsi:
+                            fig.add_trace(
+                                go.Scatter(x=hist.index, y=rsi_series, mode="lines",
+                                           line=dict(color="#79c0ff", width=1.2), name=t("rsi")),
+                                row=current_row, col=1,
+                            )
+                            # 과매수/과매도 기준선
+                            fig.add_hline(y=70, line_dash="dash", line_color="rgba(248,81,73,0.5)",
+                                          row=current_row, col=1)
+                            fig.add_hline(y=30, line_dash="dash", line_color="rgba(63,185,80,0.5)",
+                                          row=current_row, col=1)
+                            fig.update_yaxes(range=[0, 100], row=current_row, col=1)
+                            current_row += 1
+
+                        # [신규] MACD
+                        if show_macd:
+                            hist_colors = ["#3fb950" if v >= 0 else "#f85149" for v in macd_hist_vals]
+                            fig.add_trace(
+                                go.Bar(x=hist.index, y=macd_hist_vals, marker_color=hist_colors,
+                                       opacity=0.6, name=t("macd_hist")),
+                                row=current_row, col=1,
+                            )
+                            fig.add_trace(
+                                go.Scatter(x=hist.index, y=macd_line, mode="lines",
+                                           line=dict(color="#58a6ff", width=1.2), name=t("macd")),
+                                row=current_row, col=1,
+                            )
+                            fig.add_trace(
+                                go.Scatter(x=hist.index, y=signal_line, mode="lines",
+                                           line=dict(color="#f0883e", width=1.2), name=t("macd_signal")),
+                                row=current_row, col=1,
+                            )
+
+                        chart_height = 500 + (show_rsi * 120) + (show_macd * 120)
                         fig.update_layout(
-                            height=560,
+                            height=chart_height,
                             margin=dict(l=0, r=0, t=10, b=0),
                             xaxis_rangeslider_visible=False,
                             template="plotly_dark",
@@ -1181,15 +1652,10 @@ if (fetch_button or force_trigger) and resolved_ticker:
                             plot_bgcolor="rgba(0,0,0,0)",
                             showlegend=True,
                             legend=dict(
-                                orientation="h",
-                                yanchor="bottom",
-                                y=1.02,
-                                xanchor="left",
-                                x=0,
-                                font=dict(size=11, color="#8b949e"),
+                                orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="left", x=0, font=dict(size=11, color="#8b949e"),
                             ),
                             xaxis=dict(showgrid=True, gridcolor="#21262d", zeroline=False, color="#8b949e"),
-                            xaxis2=dict(showgrid=True, gridcolor="#21262d", zeroline=False, color="#8b949e"),
                             yaxis=dict(showgrid=True, gridcolor="#21262d", zeroline=False, color="#8b949e", side="right"),
                             yaxis2=dict(showgrid=True, gridcolor="#21262d", zeroline=False, color="#8b949e", side="right"),
                         )
@@ -1200,21 +1666,14 @@ if (fetch_button or force_trigger) and resolved_ticker:
                 # ── TAB 2 : Financials ──
                 with tab2:
                     if not financials.empty:
-                        # 1. Visualization of Trends
                         st.markdown(f"### {t('growth_analysis')}")
-                        
-                        # Prepare data for plotting
-                        # financials is Ticker.financials, usually indexed by account name, columns are dates
                         try:
-                            # Extract Revenue and Net Income
-                            # Note: yfinance account names can vary slightly, so we use common keywords
                             fin_t = financials.T
                             rev_key = next((k for k in fin_t.columns if 'Total Revenue' in k or 'Revenue' in k), None)
                             ni_key = next((k for k in fin_t.columns if 'Net Income' in k), None)
                             op_key = next((k for k in fin_t.columns if 'Operating Income' in k), None)
 
                             if rev_key and ni_key:
-                                # Reverse to show chronological order
                                 plot_df = fin_t[[rev_key, ni_key]].iloc[::-1]
                                 
                                 fig_fin = go.Figure()
@@ -1230,10 +1689,8 @@ if (fetch_button or force_trigger) and resolved_ticker:
                                     name=t('net_income_label'),
                                     marker_color='#3fb950'
                                 ))
-                                
                                 fig_fin.update_layout(
-                                    height=350,
-                                    barmode='group',
+                                    height=350, barmode='group',
                                     template="plotly_dark",
                                     paper_bgcolor="rgba(0,0,0,0)",
                                     plot_bgcolor="rgba(0,0,0,0)",
@@ -1244,46 +1701,40 @@ if (fetch_button or force_trigger) and resolved_ticker:
                                 )
                                 st.plotly_chart(fig_fin, use_container_width=True)
                                 
-                                # 2. Key Calculated Metrics
                                 c1, c2, c3, c4 = st.columns(4)
-                                
-                                # YoY Revenue Growth
                                 if len(plot_df) >= 2:
                                     last_rev = plot_df[rev_key].iloc[-1]
                                     prev_rev = plot_df[rev_key].iloc[-2]
                                     rev_growth = ((last_rev - prev_rev) / prev_rev * 100) if prev_rev != 0 else 0
                                     c1.metric(t("yoy_growth"), f"{rev_growth:,.1f}%", f"{rev_growth:,.1f}%")
-                                    
-                                    # Operating Margin
+
                                     if op_key:
-                                        last_op = plot_df[op_key].iloc[-1] if op_key in plot_df.columns else fin_t[op_key].iloc[0]
-                                        op_margin = (last_op / last_rev * 100) if last_rev != 0 else 0
-                                        c2.metric(t("op_margin"), f"{op_margin:,.1f}%")
-                                        
-                                    # Net Margin
+                                        op_col = op_key if op_key in plot_df.columns else None
+                                        if op_col:
+                                            last_op = plot_df[op_col].iloc[-1]
+                                            op_margin = (last_op / last_rev * 100) if last_rev != 0 else 0
+                                            c2.metric(t("op_margin"), f"{op_margin:,.1f}%")
+
                                     last_ni = plot_df[ni_key].iloc[-1]
                                     net_margin = (last_ni / last_rev * 100) if last_rev != 0 else 0
                                     c3.metric(t("net_margin"), f"{net_margin:,.1f}%")
 
-                                # 3. Contextual Summary
                                 summary_text = f"**{t('financial_summary')}**<br>"
                                 if len(plot_df) >= 2:
                                     rev_up = plot_df[rev_key].iloc[-1] > plot_df[rev_key].iloc[-2]
                                     ni_up = plot_df[ni_key].iloc[-1] > plot_df[ni_key].iloc[-2]
-                                    
                                     if rev_up and ni_up:
                                         summary_text += f"- {t('trend_improving')}<br>"
                                     elif not rev_up and not ni_up:
                                         summary_text += f"- {t('trend_declining')}<br>"
                                     else:
                                         summary_text += f"- {t('trend_stable')}<br>"
-                                
                                 st.markdown(f"<div class='summary-box'>{summary_text}</div>", unsafe_allow_html=True)
-                                
-                        except Exception as e:
-                            st.debug(f"Analysis error: {e}")
 
-                        # 4. Raw Data View
+                        except Exception as e:
+                            # [버그수정 #8] st.debug() → st.warning()으로 수정
+                            st.warning(f"재무 데이터 분석 중 오류: {e}")
+
                         with st.expander(t("financial_data")):
                             fin_display = financials.copy()
                             fin_display.columns = [str(c).split(" ")[0] for c in fin_display.columns]
@@ -1317,7 +1768,7 @@ if (fetch_button or force_trigger) and resolved_ticker:
                             <div class='wts-card-title'>{t('market_consensus')}</div>
                             <div class='wts-row'>
                                 <span class='wts-label'>{t('recommendation')}</span>
-                                <span class='wts-value' style='color:{signal_color}'>{recommendation}</span>
+                                <span class='wts-value' style='color:{signal_color}'>{html.escape(recommendation)}</span>
                             </div>
                             <div class='wts-row'>
                                 <span class='wts-label'>{t('analyst_coverage')}</span>
@@ -1332,7 +1783,7 @@ if (fetch_button or force_trigger) and resolved_ticker:
                             <div class='wts-card-title'>{t('price_targets')}</div>
                             <div class='wts-row'>
                                 <span class='wts-label'>{t('mean_target')}</span>
-                                <span class='wts-value' style='color:#58a6ff'>{target_price} {currency}</span>
+                                <span class='wts-value' style='color:#58a6ff'>{target_price} {html.escape(currency)}</span>
                             </div>
                             <div class='wts-row'>
                                 <span class='wts-label'>{t('low_target')}</span>
@@ -1345,7 +1796,7 @@ if (fetch_button or force_trigger) and resolved_ticker:
                         </div>
                         """, unsafe_allow_html=True)
 
-                    # 52-week range with visual bar
+                    # 52주 범위 바
                     range_pct = 50
                     if isinstance(fifty_two_w_low, (int, float)) and isinstance(fifty_two_w_high, (int, float)):
                         span = fifty_two_w_high - fifty_two_w_low
@@ -1368,7 +1819,32 @@ if (fetch_button or force_trigger) and resolved_ticker:
                     </div>
                     """, unsafe_allow_html=True)
 
-                    # ── Fundamental Summary ──
+                    # [신규] 기술적 시그널 섹션
+                    if not hist.empty and len(hist) >= 30:
+                        st.markdown(f"<div class='wts-card-title' style='margin-top:16px'>{t('tech_signals')}</div>", unsafe_allow_html=True)
+                        rsi_val = compute_rsi(hist["Close"]).iloc[-1]
+                        macd_l, sig_l, _ = compute_macd(hist["Close"])
+                        macd_last = macd_l.iloc[-1]
+                        sig_last = sig_l.iloc[-1]
+
+                        badges = []
+                        if isinstance(rsi_val, float) and not pd.isna(rsi_val):
+                            if rsi_val > 70:
+                                badges.append(f"<span class='signal-badge signal-bear'>RSI {rsi_val:.1f} ▲ {t('rsi_overbought')}</span>")
+                            elif rsi_val < 30:
+                                badges.append(f"<span class='signal-badge signal-bull'>RSI {rsi_val:.1f} ▼ {t('rsi_oversold')}</span>")
+                            else:
+                                badges.append(f"<span class='signal-badge signal-neutral'>RSI {rsi_val:.1f} — {t('rsi_neutral')}</span>")
+
+                        if not pd.isna(macd_last) and not pd.isna(sig_last):
+                            if macd_last > sig_last:
+                                badges.append(f"<span class='signal-badge signal-bull'>MACD ▲ {t('macd_bullish')}</span>")
+                            else:
+                                badges.append(f"<span class='signal-badge signal-bear'>MACD ▼ {t('macd_bearish')}</span>")
+
+                        st.markdown("<br>".join(badges), unsafe_allow_html=True)
+
+                    # ── 펀더멘털 요약 ──
                     summary_parts = []
                     if isinstance(pe_ratio, (int, float)):
                         if pe_ratio < 0:
@@ -1394,7 +1870,7 @@ if (fetch_button or force_trigger) and resolved_ticker:
                         summary_parts.append(f"- **Income:** {t('income_yield').format(div_yield * 100)}")
 
                     if summary_parts:
-                        header = f"**{t('sys_assessment').format(company_name, ticker_symbol)}**<br><br>"
+                        header = f"**{t('sys_assessment').format(html.escape(company_name), html.escape(ticker_symbol))}**<br><br>"
                         body = "<br>".join(summary_parts)
                         st.markdown(f"<div class='summary-box'>{header}{body}</div>", unsafe_allow_html=True)
 
@@ -1402,7 +1878,6 @@ if (fetch_button or force_trigger) and resolved_ticker:
             # RIGHT:  INFO PANEL  (consensus summary · news feed)
             # ──────────────────────────────────────────────────────────
             with info_col:
-                # ── Compact Consensus Card ──
                 recommendation = info.get("recommendationKey", "N/A").upper().replace("_", " ")
                 is_buy = "BUY" in recommendation or "OUTPERFORM" in recommendation
                 is_sell = "SELL" in recommendation or "UNDERPERFORM" in recommendation
@@ -1413,17 +1888,16 @@ if (fetch_button or force_trigger) and resolved_ticker:
                 <div class='wts-card'>
                     <div class='wts-card-title'>{t('market_consensus')}</div>
                     <div style='text-align:center;padding:8px 0'>
-                        <div style='font-size:28px;font-weight:700;color:{signal_color}'>{recommendation}</div>
+                        <div style='font-size:28px;font-weight:700;color:{signal_color}'>{html.escape(recommendation)}</div>
                         <div style='color:#8b949e;font-size:11px;margin-top:4px'>{t('analyst_coverage')}: {info.get('numberOfAnalystOpinions','N/A')} {t('analysts')}</div>
                     </div>
                     <div class='wts-row' style='margin-top:6px'>
                         <span class='wts-label'>{t('mean_target')}</span>
-                        <span class='wts-value' style='color:#58a6ff'>{target_price_val} {currency}</span>
+                        <span class='wts-value' style='color:#58a6ff'>{target_price_val} {html.escape(currency)}</span>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ── 52W compact ──
                 fifty_two_w_high = info.get("fiftyTwoWeekHigh", "N/A")
                 fifty_two_w_low = info.get("fiftyTwoWeekLow", "N/A")
                 range_pct = 50
@@ -1449,7 +1923,6 @@ if (fetch_button or force_trigger) and resolved_ticker:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # ── Dividend ──
                 div_yield = info.get("dividendYield", 0)
                 if isinstance(div_yield, (int, float)) and div_yield > 0:
                     st.markdown(f"""
@@ -1471,10 +1944,14 @@ if (fetch_button or force_trigger) and resolved_ticker:
                     news_html = ""
                     for item in news:
                         link = item["link"] if item["link"] else "#"
+                        # [버그수정 #6] html.escape()로 XSS 방지
+                        safe_title = html.escape(item.get("title", ""))
+                        safe_pub = html.escape(item.get("publisher", ""))
+                        safe_date = html.escape(item.get("date", ""))
                         news_html += f"""
                         <div class='news-item'>
-                            <a href='{link}' target='_blank'>{item['title']}</a>
-                            <div class='news-meta'>{item['publisher']} · {item['date']}</div>
+                            <a href='{html.escape(link)}' target='_blank'>{safe_title}</a>
+                            <div class='news-meta'>{safe_pub} · {safe_date}</div>
                         </div>
                         """
                     news_html += f"<p style='color:#484f58;font-size:10px;margin-top:8px'>{t('news_ref')}</p>"
@@ -1487,5 +1964,4 @@ if (fetch_button or force_trigger) and resolved_ticker:
 
 else:
     if not fetch_button:
-        # ── Dashboard (M-able Wide style) ──
         render_home_dashboard()
